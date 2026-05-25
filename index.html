@@ -265,6 +265,7 @@
                             <th class="p-3 font-bold w-1/3">名前 <span class="text-xs font-normal text-gray-500">(必須)</span></th>
                             <th class="p-3 font-bold w-24">性別</th>
                             <th class="p-3 font-bold">係・当番名 <span class="text-xs font-normal text-gray-500">(任意)</span></th>
+                            <th class="p-3 font-bold w-40 text-center">今のポイント</th>
                         </tr>
                     </thead>
                     <tbody id="settingsTableBody">
@@ -485,6 +486,7 @@
         let activityData = {};
         let studentList = [];
         let classGameData = { defeatedBosses: [] }; // 追加: ゲーム全体データ
+        let holidayOverride = {}; // 土日祝の自動「一括休」を手動で上書きした日: true=休扱い, false=通常日扱い
         let isTeacherMode = false;
         let pendingTab = null;
 
@@ -565,6 +567,18 @@
                     classGameData = { defeatedBosses: [] };
                 }
             }
+
+            const holidayStored = localStorage.getItem('classHolidayOverride');
+            if (holidayStored) {
+                try { holidayOverride = JSON.parse(holidayStored); } catch(e) {
+                    console.error('holidayOverrideの読み込みに失敗:', e);
+                    holidayOverride = {};
+                }
+            }
+        }
+
+        function saveHolidayOverride() {
+            localStorage.setItem('classHolidayOverride', JSON.stringify(holidayOverride));
         }
 
         function saveActivityData() {
@@ -660,6 +674,99 @@
             const m = String(date.getMonth() + 1).padStart(2, '0');
             const d = String(date.getDate()).padStart(2, '0');
             return `${y}-${m}-${d}`;
+        }
+
+        // --- 日本の祝日判定(春分秋分含む / 振替休日対応) ---
+        // 春分・秋分の計算式は1980-2099年で有効
+        function getShunbunDay(year) {
+            return Math.floor(20.8431 + 0.242194 * (year - 1980)) - Math.floor((year - 1980) / 4);
+        }
+        function getShubunDay(year) {
+            return Math.floor(23.2488 + 0.242194 * (year - 1980)) - Math.floor((year - 1980) / 4);
+        }
+        // 第n月曜日の日付を返す(ハッピーマンデー用)
+        function getNthMonday(year, month, n) {
+            const d = new Date(year, month - 1, 1);
+            const firstMondayOffset = (8 - d.getDay()) % 7; // 日曜=0なので
+            return 1 + firstMondayOffset + (n - 1) * 7;
+        }
+        function isHolidayCore(date) {
+            const y = date.getFullYear();
+            const m = date.getMonth() + 1;
+            const d = date.getDate();
+            // 固定祝日
+            if (m === 1 && d === 1) return true;   // 元日
+            if (m === 2 && d === 11) return true;  // 建国記念の日
+            if (m === 2 && d === 23) return true;  // 天皇誕生日
+            if (m === 4 && d === 29) return true;  // 昭和の日
+            if (m === 5 && d === 3) return true;   // 憲法記念日
+            if (m === 5 && d === 4) return true;   // みどりの日
+            if (m === 5 && d === 5) return true;   // こどもの日
+            if (m === 8 && d === 11) return true;  // 山の日
+            if (m === 11 && d === 3) return true;  // 文化の日
+            if (m === 11 && d === 23) return true; // 勤労感謝の日
+            // ハッピーマンデー
+            if (m === 1 && d === getNthMonday(y, 1, 2)) return true;  // 成人の日
+            if (m === 7 && d === getNthMonday(y, 7, 3)) return true;  // 海の日
+            if (m === 9 && d === getNthMonday(y, 9, 3)) return true;  // 敬老の日
+            if (m === 10 && d === getNthMonday(y, 10, 2)) return true;// スポーツの日
+            // 春分・秋分
+            if (m === 3 && d === getShunbunDay(y)) return true;
+            if (m === 9 && d === getShubunDay(y)) return true;
+            return false;
+        }
+        function isJapaneseHoliday(date) {
+            if (isHolidayCore(date)) return true;
+            // 振替休日: ある祝日が日曜の場合、その日以降で最初の平日(祝日でない日)が振替休日
+            // 当日より前にさかのぼり、日曜の祝日が間に連続して挟まっていないか確認
+            const d = new Date(date);
+            // 当日が祝日でなく、かつ前日まで遡って「日曜の祝日」があれば振替
+            let check = new Date(d);
+            check.setDate(check.getDate() - 1);
+            while (isHolidayCore(check)) {
+                if (check.getDay() === 0) return true; // 日曜の祝日があった
+                check.setDate(check.getDate() - 1);
+                // 安全策: 7日以上遡らない
+                if ((d - check) > 7 * 86400000) break;
+            }
+            return false;
+        }
+        // 土日祝判定
+        function isAutoHolidayDate(date) {
+            const dow = date.getDay();
+            if (dow === 0 || dow === 6) return true; // 日曜・土曜
+            return isJapaneseHoliday(date);
+        }
+        // この日付が「全員休扱い」にすべきか(手動オーバーライド込みの最終判定)
+        function isEffectivelyAllAbsent(date) {
+            const key = getDateKey(date);
+            if (Object.prototype.hasOwnProperty.call(holidayOverride, key)) {
+                return holidayOverride[key]; // 手動操作優先
+            }
+            return isAutoHolidayDate(date);
+        }
+
+        // --- 今学期の起点日(4月以降) ---
+        function getSemesterStartKey() {
+            const today = new Date();
+            const y = today.getFullYear();
+            const m = today.getMonth() + 1; // 1-12
+            // 1〜3月なら前年の4月1日、それ以外は今年の4月1日
+            const startYear = (m <= 3) ? y - 1 : y;
+            return `${startYear}-04-01`;
+        }
+        // 児童ごとの今学期チェック数集計
+        function getStudentCheckCounts(studentId) {
+            const startKey = getSemesterStartKey();
+            let toban = 0, shukudai = 0;
+            for (const dateKey in activityData) {
+                if (dateKey < startKey) continue;
+                const rec = activityData[dateKey]?.[studentId];
+                if (!rec) continue;
+                if (rec.toban) toban++;
+                if (rec.shukudai) shukudai++;
+            }
+            return { toban, shukudai };
         }
 
         // --- ロジック ---
@@ -853,6 +960,7 @@
             } else {
                 document.getElementById('view-check').classList.add('hidden');
                 document.getElementById('view-settings').classList.remove('hidden');
+                initSettingsTable(); // 最新のチェック数で再描画
             }
         }
 
@@ -865,6 +973,12 @@
                 // 安全策
                 if (!studentList[i]) studentList[i] = { id: i + 1, name: "", role: "", gender: "boy", iconSeed: i + 1, lastSeededDate: "", achievements: [] };
                 const student = studentList[i];
+                const hasName = student.name && student.name.trim() !== "";
+                const counts = hasName ? getStudentCheckCounts(student.id) : { toban: 0, shukudai: 0 };
+                const totalPoints = counts.toban + counts.shukudai;
+                const pointCell = hasName
+                    ? `<span class="text-2xl font-bold text-indigo-700">${totalPoints}</span> <span class="text-sm text-gray-500">P</span>`
+                    : `<span class="text-gray-300">—</span>`;
 
                 const tr = document.createElement('tr');
                 tr.innerHTML = `
@@ -887,6 +1001,7 @@
                         <input type="text" placeholder="係名" value="${escHtml(student.role || '')}" 
                                onchange="updateStudent(${i}, 'role', this.value)">
                     </td>
+                    <td class="text-center">${pointCell}</td>
                 `;
                 tbody.appendChild(tr);
             }
@@ -922,7 +1037,9 @@
             const dateKey = getDateKey(currentDate);
             if (!activityData[dateKey]) activityData[dateKey] = {};
             const activeStudents = studentList.filter(s => s.name && s.name.trim() !== "");
-            const isAllAbsent = activeStudents.every(student => activityData[dateKey]?.[student.id]?.absent === true);
+            // 現在の「実効的な全員休状態」を判定(自動判定 or 手動上書き or 実データ)
+            const isAllAbsent = isEffectivelyAllAbsent(currentDate)
+                || (activeStudents.length > 0 && activeStudents.every(student => activityData[dateKey]?.[student.id]?.absent === true));
             const newAbsentState = !isAllAbsent; 
 
             activeStudents.forEach(student => {
@@ -935,6 +1052,9 @@
                     activityData[dateKey][student.id].shukudai = false;
                 }
             });
+            // 手動操作を記録(土日祝の自動判定を上書き)
+            holidayOverride[dateKey] = newAbsentState;
+            saveHolidayOverride();
             saveActivityData();
             renderCheckView();
         }
@@ -1193,6 +1313,7 @@
                 localStorage.removeItem('classTeacherPassword');
                 localStorage.removeItem('classBossHpPerLevel');
                 localStorage.removeItem('classGameData');
+                localStorage.removeItem('classHolidayOverride');
                 location.reload();
             }
         }
@@ -1306,6 +1427,20 @@
             if (count === 0) {
                 container.innerHTML = `<div class="col-span-full text-center py-12 glass rounded-xl"><p class="text-xl font-bold text-gray-600 mb-2">生徒が登録されていません</p><button onclick="switchTab('settings')" class="mt-4 bg-indigo-600 text-white px-6 py-2 rounded-full shadow-lg">設定画面へ</button></div>`;
                 return;
+            }
+
+            // 土日祝の自動「一括休」: 手動で外していない場合のみ、表示時点で全員absentに設定
+            if (isEffectivelyAllAbsent(currentDate)) {
+                if (!activityData[dateKey]) activityData[dateKey] = {};
+                let modified = false;
+                activeStudents.forEach(student => {
+                    const rec = activityData[dateKey][student.id];
+                    if (!rec || rec.absent !== true) {
+                        activityData[dateKey][student.id] = { toban: false, shukudai: false, absent: true };
+                        modified = true;
+                    }
+                });
+                if (modified) saveActivityData();
             }
 
             // 全員休ボタン状態
